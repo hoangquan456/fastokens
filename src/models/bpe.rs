@@ -9,7 +9,6 @@ use std::{
     },
 };
 
-use daachorse::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -578,7 +577,6 @@ impl MergeAdjacency {
 pub struct Bpe {
     #[serde(skip)]
     id: usize,
-    daac: DoubleArrayAhoCorasick<TokenId>,
     merge_map: MergeMap,
     unmerge_map: Vec<(TokenId, TokenId)>,
     next_prefix_map: Vec<TokenId>,
@@ -724,13 +722,6 @@ impl Bpe {
             }
         }
 
-        let daac = DoubleArrayAhoCorasickBuilder::new()
-            .match_kind(daachorse::MatchKind::LeftmostLongest)
-            .build_with_values(vocab_r.iter().filter_map(|(&token, pattern)| {
-                (!is_orphan[token as usize]).then_some((pattern, token))
-            }))
-            .map_err(|e| format!("error building DAAC: {e}"))?;
-
         let token_lens: Vec<u16> = (0..=max_token)
             .map(|t| {
                 u16::try_from(vocab_r[&t].len())
@@ -747,9 +738,15 @@ impl Bpe {
                 if last_char_start == 0 {
                     return INVALID_TOKEN;
                 }
-                daac.leftmost_find_iter(&token_str[..last_char_start])
-                    .next()
-                    .map_or(INVALID_TOKEN, |m| m.value())
+                let prefix = &token_str[..last_char_start];
+                // Find longest prefix substring that is a vocab token.
+                let mut result = INVALID_TOKEN;
+                for end in prefix.char_indices().map(|(i, _)| i).skip(1).chain(std::iter::once(prefix.len())) {
+                    if let Some(&id) = vocab.get(&prefix[..end]) {
+                        result = id;
+                    }
+                }
+                result
             })
             .collect();
 
@@ -789,7 +786,6 @@ impl Bpe {
 
         Ok(Self {
             id: BPE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
-            daac,
             merge_map: flat_merge_map,
             unmerge_map,
             next_prefix_map,
@@ -842,11 +838,6 @@ impl Bpe {
         }
     }
 
-    fn next_match(&self, input: &str) -> Option<TokenId> {
-        let m = self.daac.leftmost_find_iter(input).next()?;
-        (m.start() == 0).then(|| m.value())
-    }
-
     pub fn tokenize(&self, input: &str) -> Result<Vec<TokenId>> {
         let mut out = Vec::new();
         self.tokenize_into(input, &mut out)?;
@@ -859,9 +850,7 @@ impl Bpe {
             return Ok(());
         }
 
-        if let Some(token) = self.next_match(input)
-            && self.token_lens[token as usize] as usize == input.len()
-        {
+        if let Some(&token) = self.token_to_id.get(input) {
             out.push(token);
             return Ok(());
         }
@@ -1197,7 +1186,6 @@ impl Clone for Bpe {
     fn clone(&self) -> Self {
         Self {
             id: BPE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
-            daac: self.daac.clone(),
             merge_map: self.merge_map.clone(),
             unmerge_map: self.unmerge_map.clone(),
             next_prefix_map: self.next_prefix_map.clone(),
@@ -1225,8 +1213,7 @@ impl fmt::Debug for Bpe {
 
 impl PartialEq for Bpe {
     fn eq(&self, other: &Self) -> bool {
-        self.daac == other.daac
-            && self.merge_map == other.merge_map
+        self.merge_map == other.merge_map
             && self.unmerge_map == other.unmerge_map
             && self.next_prefix_map == other.next_prefix_map
             && self.token_lens == other.token_lens
